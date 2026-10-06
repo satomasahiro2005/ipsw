@@ -148,7 +148,7 @@ func createGitDiffPatch(src, dst string, conf *GitDiffConfig) (string, error) {
 
 	os.WriteFile(tmpDst.Name(), []byte(dst), 0644)
 
-	cmd := exec.Command("git", "diff", "--no-color", "--no-index", tmpSrc.Name(), tmpDst.Name())
+	cmd := exec.Command("git", "diff", "--no-color", "--unified=0", "--no-index", tmpSrc.Name(), tmpDst.Name())
 
 	dat, _ := cmd.CombinedOutput()
 
