@@ -300,7 +300,8 @@ func FormatUpdatedDiff(oldInfo, newInfo *DiffInfo, conf *DiffConfig) (string, er
 		return "", fmt.Errorf("nil diff info")
 	}
 
-	out, err := utils.GitDiff(oldInfo.stringForDiff(conf)+"\n", newInfo.stringForDiff(conf)+"\n", &utils.GitDiffConfig{Color: conf.Color, Tool: conf.DiffTool})
+	sizeChanges := sectionSizeChanges(oldInfo, newInfo)
+	out, err := utils.GitDiff(oldInfo.metadataStringForDiff(conf)+"\n", newInfo.metadataStringForDiff(conf)+"\n", &utils.GitDiffConfig{Color: conf.Color, Tool: conf.DiffTool})
 	if err != nil {
 		return "", err
 	}
@@ -469,16 +470,52 @@ func FormatUpdatedDiff(oldInfo, newInfo *DiffInfo, conf *DiffConfig) (string, er
 		}
 	}
 
-	if b.Len() == 0 && len(sectionChanges) == 0 {
+	if b.Len() == 0 && len(sectionChanges) == 0 && len(sizeChanges) == 0 {
 		return "", nil
 	}
 	if !conf.Markdown {
-		return b.String(), nil
+		var text strings.Builder
+		if len(sizeChanges) > 0 {
+			text.WriteString("Section size changes:\n")
+			for _, change := range sizeChanges {
+				fmt.Fprintf(&text, "~ %s: %s -> %s (%s)\n",
+					change.Name,
+					formatSectionSize(change.OldSize, change.OldPresent),
+					formatSectionSize(change.NewSize, change.NewPresent),
+					formatSectionSizeDelta(change),
+				)
+			}
+		}
+		if len(sectionChanges) > 0 {
+			text.WriteString("Sections with same size but changed content:\n")
+			for _, name := range sectionChanges {
+				fmt.Fprintf(&text, "- %s\n", name)
+			}
+		}
+		text.WriteString(b.String())
+		return text.String(), nil
 	}
 
 	var md strings.Builder
+	if len(sizeChanges) > 0 {
+		md.WriteString("### Section Size Changes\n\n")
+		md.WriteString("| Section | Old | New | Δ |\n")
+		md.WriteString("| :-- | --: | --: | --: |\n")
+		for _, change := range sizeChanges {
+			name := strings.ReplaceAll(change.Name, "|", "\\|")
+			fmt.Fprintf(&md, "| `%s` | `%s` | `%s` | **`%s`** |\n",
+				name,
+				formatSectionSize(change.OldSize, change.OldPresent),
+				formatSectionSize(change.NewSize, change.NewPresent),
+				formatSectionSizeDelta(change),
+			)
+		}
+	}
 	if len(sectionChanges) > 0 {
-		md.WriteString("### Sections with Same Size but Changed Content\n\n")
+		if md.Len() > 0 {
+			md.WriteByte('\n')
+		}
+		md.WriteString("### Same-size Content Changes\n\n")
 		for _, name := range sectionChanges {
 			md.WriteString(fmt.Sprintf("- `%s`\n", name))
 		}
@@ -489,6 +526,7 @@ func FormatUpdatedDiff(oldInfo, newInfo *DiffInfo, conf *DiffConfig) (string, er
 	if md.Len() > 0 {
 		md.WriteByte('\n')
 	}
+	md.WriteString("### Other Changes\n\n")
 	fence := "text"
 	if hasDiffRows {
 		fence = "diff"
@@ -518,9 +556,23 @@ type DiffConfig struct {
 }
 
 type MachoDiff struct {
-	New     []string          `json:"new,omitempty"`
-	Removed []string          `json:"removed,omitempty"`
-	Updated map[string]string `json:"updated,omitempty"`
+	New       []string          `json:"new,omitempty"`
+	Removed   []string          `json:"removed,omitempty"`
+	Updated   map[string]string `json:"updated,omitempty"`
+	SizeDelta map[string]uint64 `json:"-"`
+}
+
+func (diff *MachoDiff) recordUpdated(key, formatted string, oldInfo, newInfo *DiffInfo) {
+	if diff.Updated == nil {
+		diff.Updated = make(map[string]string)
+	}
+	diff.Updated[key] = formatted
+	if score := sectionSizeChangeScore(oldInfo, newInfo); score > 0 {
+		if diff.SizeDelta == nil {
+			diff.SizeDelta = make(map[string]uint64)
+		}
+		diff.SizeDelta[key] = score
+	}
 }
 
 type section struct {
@@ -1117,6 +1169,95 @@ func appendFunctionSummary(out, functions *strings.Builder) {
 // diff'd section list, so those are skipped; this surfaces the same-size content
 // edits that dropping the per-section sha256 from DiffInfo.String would otherwise
 // hide, without re-introducing the sha256 wall.
+type sectionSizeChange struct {
+	Name       string
+	OldSize    uint64
+	NewSize    uint64
+	OldPresent bool
+	NewPresent bool
+}
+
+func (c sectionSizeChange) magnitude() uint64 {
+	switch {
+	case !c.OldPresent:
+		return c.NewSize
+	case !c.NewPresent:
+		return c.OldSize
+	case c.NewSize >= c.OldSize:
+		return c.NewSize - c.OldSize
+	default:
+		return c.OldSize - c.NewSize
+	}
+}
+
+// sectionSizeChanges returns only sections whose size or presence changed.
+// Largest changes come first so reports surface the most significant binary
+// layout changes before small alignment/padding churn.
+func sectionSizeChanges(oldInfo, newInfo *DiffInfo) []sectionSizeChange {
+	oldSections := make(map[string]section, len(oldInfo.Sections))
+	newSections := make(map[string]section, len(newInfo.Sections))
+	for _, sec := range oldInfo.Sections {
+		oldSections[sec.Name] = sec
+	}
+	for _, sec := range newInfo.Sections {
+		newSections[sec.Name] = sec
+	}
+
+	names := make(map[string]struct{}, len(oldSections)+len(newSections))
+	for name := range oldSections {
+		names[name] = struct{}{}
+	}
+	for name := range newSections {
+		names[name] = struct{}{}
+	}
+
+	changes := make([]sectionSizeChange, 0)
+	for name := range names {
+		oldSec, oldOK := oldSections[name]
+		newSec, newOK := newSections[name]
+		if oldOK && newOK && oldSec.Size == newSec.Size {
+			continue
+		}
+		changes = append(changes, sectionSizeChange{
+			Name:       name,
+			OldSize:    oldSec.Size,
+			NewSize:    newSec.Size,
+			OldPresent: oldOK,
+			NewPresent: newOK,
+		})
+	}
+	sort.Slice(changes, func(i, j int) bool {
+		mi, mj := changes[i].magnitude(), changes[j].magnitude()
+		if mi != mj {
+			return mi > mj
+		}
+		return changes[i].Name < changes[j].Name
+	})
+	return changes
+}
+
+// sectionSizeChangeScore is used only for ordering Mach-Os in the report. It is
+// the saturating sum of absolute per-section size deltas. A zero-sized
+// added/removed section still returns 1 so presence changes remain prioritized.
+func sectionSizeChangeScore(oldInfo, newInfo *DiffInfo) uint64 {
+	changes := sectionSizeChanges(oldInfo, newInfo)
+	if len(changes) == 0 {
+		return 0
+	}
+	var total uint64
+	for _, change := range changes {
+		next, carry := bits.Add64(total, change.magnitude(), 0)
+		if carry != 0 {
+			return ^uint64(0)
+		}
+		total = next
+	}
+	if total == 0 {
+		return 1
+	}
+	return total
+}
+
 func sectionContentChanges(oldInfo, newInfo *DiffInfo) []string {
 	if len(oldInfo.Sections) == 0 || len(newInfo.Sections) == 0 {
 		return nil
@@ -1131,6 +1272,7 @@ func sectionContentChanges(oldInfo, newInfo *DiffInfo) []string {
 			changes = append(changes, oldSec.Name)
 		}
 	}
+	slices.Sort(changes)
 	return changes
 }
 
@@ -1278,6 +1420,46 @@ func (i *DiffInfo) stringForDiff(conf *DiffConfig) string {
 	return out.String()
 }
 
+func (i *DiffInfo) metadataStringForDiff(conf *DiffConfig) string {
+	ignoreBuildTimestamps := conf != nil && conf.IgnoreBuildTimestamps
+	var out strings.Builder
+	if i.Version != "" {
+		out.WriteString(i.Version + "\n")
+	}
+	imports := slices.Clone(i.Imports)
+	slices.Sort(imports)
+	for _, imp := range imports {
+		out.WriteString(fmt.Sprintf("  - %s\n", imp))
+	}
+	if i.Verbose && i.UUID != "" {
+		out.WriteString(fmt.Sprintf("  UUID: %s\n", i.UUID))
+	}
+	out.WriteString(fmt.Sprintf("  Functions: %d\n", i.Functions))
+	out.WriteString(fmt.Sprintf("  Symbols:   %d\n", len(normalizedStringSet(i.Symbols, normalizeSymbolForDiff))))
+	out.WriteString(fmt.Sprintf("  CStrings:  %d\n", len(normalizedStringSet(i.CStrings, cstringNormalizer(ignoreBuildTimestamps)))))
+	return out.String()
+}
+
+func formatSectionSize(size uint64, present bool) string {
+	if !present {
+		return "—"
+	}
+	return fmt.Sprintf("%#x", size)
+}
+
+func formatSectionSizeDelta(change sectionSizeChange) string {
+	switch {
+	case !change.OldPresent:
+		return fmt.Sprintf("+%#x", change.NewSize)
+	case !change.NewPresent:
+		return fmt.Sprintf("-%#x", change.OldSize)
+	case change.NewSize >= change.OldSize:
+		return fmt.Sprintf("+%#x", change.NewSize-change.OldSize)
+	default:
+		return fmt.Sprintf("-%#x", change.OldSize-change.NewSize)
+	}
+}
+
 func (diff *MachoDiff) Generate(prev, next map[string]*DiffInfo, conf *DiffConfig) error {
 
 	/* DIFF IPSW */
@@ -1303,7 +1485,7 @@ func (diff *MachoDiff) Generate(prev, next map[string]*DiffInfo, conf *DiffConfi
 			if formatted == "" {
 				continue
 			}
-			diff.Updated[currentFileKey] = formatted
+			diff.recordUpdated(currentFileKey, formatted, dat1, dat2)
 		}
 	}
 
@@ -1361,7 +1543,7 @@ func DiffIPSW(oldIPSW, newIPSW string, conf *DiffConfig) (*MachoDiff, error) {
 			return err
 		}
 		if formatted != "" {
-			diff.Updated[path] = formatted
+			diff.recordUpdated(path, formatted, oldInfo, newInfo)
 		}
 		prevKeys[path] = true
 		return nil
@@ -1438,7 +1620,7 @@ func DiffMounts(oldRoots, newRoots []MountRoot, conf *DiffConfig) (*MachoDiff, e
 				return err
 			}
 			if formatted != "" {
-				diff.Updated[path] = formatted
+				diff.recordUpdated(path, formatted, oldInfo, newInfo)
 			}
 			prevKeys[path] = true
 			return nil
@@ -1512,7 +1694,7 @@ func DiffFirmwares(oldIPSW, newIPSW string, conf *DiffConfig) (*MachoDiff, error
 			return err
 		}
 		if formatted != "" {
-			diff.Updated[path] = formatted
+			diff.recordUpdated(path, formatted, oldInfo, newInfo)
 		}
 		prevKeys[path] = true
 		return nil
