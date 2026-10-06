@@ -572,9 +572,31 @@ func renderMachoDiff(out *strings.Builder, base listSection, diff *mcmd.MachoDif
 	if err := renderNameList(out, rmSec, diff.Removed, outputDir); err != nil {
 		return err
 	}
-	upSec := base
-	upSec.title, upSec.tag = "⬆️ Updated", "Updated"
-	return renderUpdatedEntries(out, upSec, diff.Updated, outputDir, filepath.Base, diff.SizeDelta)
+	sizeChanged := make(map[string]string)
+	otherUpdated := make(map[string]string)
+	for key, body := range diff.Updated {
+		if diff.SizeDelta[key] > 0 {
+			sizeChanged[key] = body
+		} else {
+			otherUpdated[key] = body
+		}
+	}
+
+	if len(sizeChanged) > 0 {
+		sizeSec := base
+		sizeSec.title, sizeSec.tag = "📐 Size Changed", "SizeChanged"
+		if err := renderUpdatedEntries(out, sizeSec, sizeChanged, outputDir, filepath.Base, diff.SizeDelta); err != nil {
+			return err
+		}
+	}
+	if len(otherUpdated) > 0 {
+		upSec := base
+		upSec.title, upSec.tag = "⬆️ Other Updated", "Updated"
+		if err := renderUpdatedEntries(out, upSec, otherUpdated, outputDir, filepath.Base); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // writeSideCar writes body verbatim to outputDir/subDir/relName, creating the
