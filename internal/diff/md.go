@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/apex/log"
@@ -467,10 +468,35 @@ func renderSideCarEntries[V any](out *strings.Builder, sec listSection, m map[st
 // renderUpdatedEntries renders an "Updated" list: every entry's diff is written
 // to its own path-mirrored side-car (never inlined) and the README shows the
 // list of links under the shared plain/collapsed/spill rule.
-func renderUpdatedEntries(out *strings.Builder, sec listSection, updated map[string]string, outputDir string, displayName func(string) string) error {
-	return renderSideCarEntries(out, sec, updated, outputDir, func(k, diff string) string {
-		return plistDocBody(displayName(k), k, diff)
+func renderUpdatedEntries(out *strings.Builder, sec listSection, updated map[string]string, outputDir string, displayName func(string) string, sizeDelta ...map[string]uint64) error {
+	if len(updated) == 0 {
+		return nil
+	}
+	keys := slices.Collect(maps.Keys(updated))
+	var scores map[string]uint64
+	if len(sizeDelta) > 0 {
+		scores = sizeDelta[0]
+	}
+	slices.SortFunc(keys, func(a, b string) int {
+		sa, sb := scores[a], scores[b]
+		if sa != sb {
+			if sa > sb {
+				return -1
+			}
+			return 1
+		}
+		return strings.Compare(a, b)
 	})
+	rel := sideCarRelNames(keys, sec.groupDir)
+	entries := make([]linkEntry, 0, len(keys))
+	for _, k := range keys {
+		body := plistDocBody(displayName(k), k, updated[k])
+		if _, err := writeSideCar(outputDir, sec.subDir, rel[k], body); err != nil {
+			return err
+		}
+		entries = append(entries, linkEntry{k, rel[k]})
+	}
+	return renderLinkList(out, sec, entries, outputDir)
 }
 
 // renderBinStringList renders an iBoot-style section: each entry is a named bin
@@ -547,9 +573,76 @@ func renderMachoDiff(out *strings.Builder, base listSection, diff *mcmd.MachoDif
 	if err := renderNameList(out, rmSec, diff.Removed, outputDir); err != nil {
 		return err
 	}
-	upSec := base
-	upSec.title, upSec.tag = "⬆️ Updated", "Updated"
-	return renderUpdatedEntries(out, upSec, diff.Updated, outputDir, filepath.Base)
+	sizeChanged := make(map[string]string)
+	otherUpdated := make(map[string]string)
+	sizeScores := make(map[string]uint64)
+	for key, body := range diff.Updated {
+		score := diff.SizeDelta[key]
+		if score == 0 {
+			score = renderedSectionSizeChangeScore(body)
+		}
+		if score > 0 {
+			sizeChanged[key] = body
+			sizeScores[key] = score
+		} else {
+			otherUpdated[key] = body
+		}
+	}
+
+	if len(sizeChanged) > 0 {
+		sizeSec := base
+		sizeSec.title, sizeSec.tag = "📐 Size Changed", "SizeChanged"
+		if err := renderUpdatedEntries(out, sizeSec, sizeChanged, outputDir, filepath.Base, sizeScores); err != nil {
+			return err
+		}
+	}
+	if len(otherUpdated) > 0 {
+		upSec := base
+		upSec.title, upSec.tag = "⬆️ Other Updated", "Updated"
+		if err := renderUpdatedEntries(out, upSec, otherUpdated, outputDir, filepath.Base); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// renderedSectionSizeChangeScore recovers the aggregate absolute section-size
+// delta from a rendered Markdown body. This is a deliberate fallback for
+// producers/cache rows that carry rendered Updated text but not SizeDelta
+// metadata; it keeps README prioritization correct from the report itself.
+func renderedSectionSizeChangeScore(body string) uint64 {
+	if !strings.Contains(body, "### Section Size Changes") {
+		return 0
+	}
+	var total uint64
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.HasPrefix(line, "| `") {
+			continue
+		}
+		cells := strings.Split(line, "|")
+		if len(cells) < 5 {
+			continue
+		}
+		delta := strings.TrimSpace(cells[4])
+		delta = strings.Trim(delta, "*` ")
+		if len(delta) < 4 || (delta[0] != '+' && delta[0] != '-') || !strings.HasPrefix(delta[1:], "0x") {
+			continue
+		}
+		mag, err := strconv.ParseUint(delta[3:], 16, 64)
+		if err != nil {
+			continue
+		}
+		if ^uint64(0)-total < mag {
+			return ^uint64(0)
+		}
+		total += mag
+	}
+	if total == 0 {
+		// A zero-sized section can still be added/removed; the heading itself
+		// is enough to keep such a binary in the prioritized group.
+		return 1
+	}
+	return total
 }
 
 // writeSideCar writes body verbatim to outputDir/subDir/relName, creating the
