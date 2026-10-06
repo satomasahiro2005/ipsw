@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/apex/log"
@@ -574,9 +575,15 @@ func renderMachoDiff(out *strings.Builder, base listSection, diff *mcmd.MachoDif
 	}
 	sizeChanged := make(map[string]string)
 	otherUpdated := make(map[string]string)
+	sizeScores := make(map[string]uint64)
 	for key, body := range diff.Updated {
-		if diff.SizeDelta[key] > 0 {
+		score := diff.SizeDelta[key]
+		if score == 0 {
+			score = renderedSectionSizeChangeScore(body)
+		}
+		if score > 0 {
 			sizeChanged[key] = body
+			sizeScores[key] = score
 		} else {
 			otherUpdated[key] = body
 		}
@@ -585,7 +592,7 @@ func renderMachoDiff(out *strings.Builder, base listSection, diff *mcmd.MachoDif
 	if len(sizeChanged) > 0 {
 		sizeSec := base
 		sizeSec.title, sizeSec.tag = "📐 Size Changed", "SizeChanged"
-		if err := renderUpdatedEntries(out, sizeSec, sizeChanged, outputDir, filepath.Base, diff.SizeDelta); err != nil {
+		if err := renderUpdatedEntries(out, sizeSec, sizeChanged, outputDir, filepath.Base, sizeScores); err != nil {
 			return err
 		}
 	}
@@ -597,6 +604,45 @@ func renderMachoDiff(out *strings.Builder, base listSection, diff *mcmd.MachoDif
 		}
 	}
 	return nil
+}
+
+// renderedSectionSizeChangeScore recovers the aggregate absolute section-size
+// delta from a rendered Markdown body. This is a deliberate fallback for
+// producers/cache rows that carry rendered Updated text but not SizeDelta
+// metadata; it keeps README prioritization correct from the report itself.
+func renderedSectionSizeChangeScore(body string) uint64 {
+	if !strings.Contains(body, "### Section Size Changes") {
+		return 0
+	}
+	var total uint64
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.HasPrefix(line, "| `") {
+			continue
+		}
+		cells := strings.Split(line, "|")
+		if len(cells) < 5 {
+			continue
+		}
+		delta := strings.TrimSpace(cells[4])
+		delta = strings.Trim(delta, "*` ")
+		if len(delta) < 4 || (delta[0] != '+' && delta[0] != '-') || !strings.HasPrefix(delta[1:], "0x") {
+			continue
+		}
+		mag, err := strconv.ParseUint(delta[3:], 16, 64)
+		if err != nil {
+			continue
+		}
+		if ^uint64(0)-total < mag {
+			return ^uint64(0)
+		}
+		total += mag
+	}
+	if total == 0 {
+		// A zero-sized section can still be added/removed; the heading itself
+		// is enough to keep such a binary in the prioritized group.
+		return 1
+	}
+	return total
 }
 
 // writeSideCar writes body verbatim to outputDir/subDir/relName, creating the
