@@ -313,12 +313,6 @@ func FormatUpdatedDiff(oldInfo, newInfo *DiffInfo, conf *DiffConfig) (string, er
 	}
 
 	sectionChanges := sectionContentChanges(oldInfo, newInfo)
-	if len(sectionChanges) > 0 && !conf.Markdown {
-		b.WriteString("Sections with same size but changed content:\n")
-		for _, name := range sectionChanges {
-			b.WriteString(fmt.Sprintf("- %s\n", name))
-		}
-	}
 
 	// Symbols
 	newSyms, rmSyms := diffNormalizedSymbols(oldInfo.Symbols, newInfo.Symbols)
