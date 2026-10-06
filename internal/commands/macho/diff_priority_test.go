@@ -31,15 +31,15 @@ func TestSectionSizeChangesLargestFirst(t *testing.T) {
 func TestFormatUpdatedDiffMarkdownPrioritizesSizeChanges(t *testing.T) {
 	oldInfo := &DiffInfo{
 		Sections: []section{
-			{Name: "__TEXT.__text", Size: 0x100, Hash: "same", HashMode: hashRaw},
-			{Name: "__TEXT.__const", Size: 0x40, Hash: "old", HashMode: hashRaw},
+			{Name: "__TEXT.__text", Size: 0x100, Hash: "same", HashMode: hashVerbatim},
+			{Name: "__TEXT.__const", Size: 0x40, Hash: "old", HashMode: hashVerbatim},
 		},
 		Functions: 10,
 	}
 	newInfo := &DiffInfo{
 		Sections: []section{
-			{Name: "__TEXT.__text", Size: 0x120, Hash: "same", HashMode: hashRaw},
-			{Name: "__TEXT.__const", Size: 0x40, Hash: "new", HashMode: hashRaw},
+			{Name: "__TEXT.__text", Size: 0x120, Hash: "same", HashMode: hashVerbatim},
+			{Name: "__TEXT.__const", Size: 0x40, Hash: "new", HashMode: hashVerbatim},
 		},
 		Functions: 11,
 	}
